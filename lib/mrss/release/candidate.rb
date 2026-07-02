@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'open3'
 
 require_relative 'product_data'
 
@@ -32,6 +33,10 @@ module Mrss
         @product ||= ProductData.new
       end
 
+      def peek_version
+        product.peek_next_version(release_type)
+      end
+
       def bump_version
         product.bump_version(release_type)
       end
@@ -40,24 +45,55 @@ module Mrss
         product.bump_version!(release_type)
       end
 
+      def save_version!
+        product.save_version!
+      end
+
       def branch_name
-        @branch_name ||= "rc-#{product.version}"
+        "rc-#{product.version}"
+      end
+
+      def current_branch_name
+        branch = `git symbolic-ref --short HEAD`.chomp
+        branch unless branch.to_s.empty?
+      end
+
+      def rc_branch?
+        current_branch_name == branch_name
+      end
+
+      def branch_exists?(branch=branch_name)
+        system('git', 'show-ref', '--verify', '--quiet', "refs/heads/#{branch}")
+      end
+
+      def uncommitted_changes?
+        !system('git', 'diff-index', '--quiet', 'HEAD', '--')
+      end
+
+      def pull_request_exists?(owner, branch)
+        head = [ owner, branch ].join(':')
+        out, = Open3.capture2('gh', 'pr', 'list', '--head', head, '--state', 'open',
+                              '--json', 'number', '--jq', 'length > 0')
+        out.to_s.strip == 'true'
       end
 
       # return a string of commit names since the last release
       def pending_changes
-        @changes ||= begin
-                       range = product.tag_exists? ? "#{product.tag_name}.." : ""
-                       `git log --pretty=format:"%s" #{range}`
-                     end
+        @changes ||= `git log --pretty=format:"%s" #{commit_range}`
       end
 
-      # return a list of PR numbers since the last release
+      # return an array of commit SHAs since the last release
+      def pending_commit_shas
+        @pending_commit_shas ||= `git log --pretty=format:"%H" #{commit_range}`.lines.map(&:chomp)
+      end
+
+      # return a list of PR numbers since the last release, determined by
+      # asking GitHub which PR each commit belongs to (rather than parsing
+      # commit messages, which aren't guaranteed to carry a "(#NNN)" suffix)
       def pending_pr_numbers
-        @pending_pr_numbers ||= pending_changes.
-          lines.
-          map { |line| line.match(/\(#(\d+)\)$/).then { |m| m && m[1] } }.
-          compact.
+        @pending_pr_numbers ||= pending_commit_shas.
+          flat_map { |sha| pr_numbers_for_commit(sha) }.
+          uniq.
           sort.reverse
       end
 
@@ -120,6 +156,33 @@ module Mrss
       end
 
       private
+
+      # the git log revision range covering commits since the last release
+      # tag (or the entire history, if no tag exists yet)
+      def commit_range
+        @commit_range ||= product.tag_exists? ? "#{product.tag_name}.." : ""
+      end
+
+      # returns the PR number(s) GitHub associates with the given commit
+      # SHA. Raises if the lookup itself fails (auth, rate limit, network);
+      # warns and returns an empty array if the commit has no associated PR
+      # (e.g. a direct push), since that's a legitimate case, not a failure.
+      def pr_numbers_for_commit(sha)
+        out, err, status = Open3.capture3(
+          'gh', 'api', "repos/{owner}/{repo}/commits/#{sha}/pulls", '--jq', '.[].number'
+        )
+
+        raise "gh api lookup failed for commit #{sha}: #{err}" unless status.success?
+
+        numbers = out.split("\n")
+
+        if numbers.empty?
+          subject = `git log -1 --pretty=format:%s #{sha}`.chomp
+          warn "warning: commit #{sha} (#{subject}) has no associated pull request -- excluding it from the release"
+        end
+
+        numbers
+      end
 
       # returns an array of strings, each string representing a single line
       # in the release notes for the PR's of the given type.
